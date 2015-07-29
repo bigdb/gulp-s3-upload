@@ -4,12 +4,34 @@ var es          = require('event-stream')
 ,   mime        = require('mime')
 ,   _           = require('underscore')
 ,   helper      = require('./src/helper.js')
-,   md5         = require('md5')
+,   hasha       = require('hasha')
+,   file        = require('vinyl-file')
+,   through     = require('through2')
+,   objectAssign = require('object-assign')
 ,   PluginError = gutil.PluginError
 ,   gulpPrefixer
+,   getCacheFile
 ;
 
 const PLUGIN_NAME = 'gulp-s3-upload';
+const CACHE_FILE_PATH = 's3-upload-cache.json';
+
+getCacheFile = function (opts, cb) {
+    file.read(opts.path, opts, function (err, cacheFile) {
+        if (err) {
+            // not found
+            if (err.code === 'ENOENT') {
+                cb(null, new gutil.File(opts));
+            } else {
+                cb(err);
+            }
+
+            return;
+        }
+
+        cb(null, cacheFile);
+    });
+}
 
 gulpPrefixer = function (AWS) {
     /*
@@ -18,17 +40,26 @@ gulpPrefixer = function (AWS) {
         - will have a catch for `bucket` vs `Bucket`
         - Will filter out `Body` and `Key` because that is handled by the script and keyTransform
     */
-    return function (options) {
+    var plugin = function (options) {
 
-        var stream, _s3 = new AWS.S3(),
+        var stream, cacheData, _s3 = new AWS.S3(),
             the_bucket = options.Bucket || options.bucket;
 
         if(!the_bucket) {
             throw new PluginError(PLUGIN_NAME, "Missing S3 bucket name!");
         }
 
-        stream = es.map(function (file, callback) {
+        try {
+            cacheData = JSON.parse(file.readSync(CACHE_FILE_PATH).contents.toString('utf-8'));
+        } catch (err) {
+            if (!err.code === 'ENOENT') {
+                throw err;
+            }
 
+            cacheData = {};
+        }
+
+        return es.map(function (file, callback) {
             var _stream = this,
                 keyTransform, keyname, keyparts, filename,
                 mimetype, mime_lookup_name, metadata;
@@ -68,93 +99,143 @@ gulpPrefixer = function (AWS) {
             // just in case user is on windows that uses backslashes
             keyname = keyname.replace(/\\/g, "/");
 
+            hasha.fromStream(file, { algorithm: 'md5' }, function (err, hash) {
+                // Assign data to be used by the cache method
+                file.keyname = keyname;
+                file.hash = hash;
+                file.bucket = the_bucket;
 
-            // === Mime Lookup/Transform ===
-
-            mime_lookup_name = keyname;
-
-            if(options.mimeTypeLookup) {
-                mime_lookup_name = options.mimeTypeLookup(keyname);
-            }
-
-            mimetype = mime.lookup(mime_lookup_name);
-
-            // === Charset ===
-            // Just in case text files get garbled. Appends to mimetype.
-            // `charset` field gets filtered out later.
-            if(options.charset && mimetype == 'text/html') {
-                mimetype += ';charset=' + options.charset;
-            }
-
-            //  === metadataMap ===
-            //  New in V1: Map your files (using the keyname) to a metadata object.
-            //  ONLY if `options.Metadata` is undefined.
-
-            if(!options.Metadata && options.metadataMap) {
-                if(helper.isMetadataMapFn(options.metadataMap)) {
-                    metadata = options.metadataMap(keyname);
-                } else {
-                    metadata = options.metadataMap;
-                }
-            }
-
-            //  options.Metadata is not filtered out later.
-
-            gutil.log(gutil.colors.cyan("Uploading ....."), keyname);
-
-            _s3.headObject({
-                'Bucket': the_bucket,
-                'Key':    keyname
-            }, function (getErr, getData) {
-
-                var objOpts;
-
-                if(getErr && getErr.statusCode !== 404) {
-                    return callback(new gutil.PluginError(PLUGIN_NAME, "S3 headObject Error: " + getErr.stack));
+                // Check upload cache
+                if(cacheData.hasOwnProperty(file.bucket) && cacheData[file.bucket].hasOwnProperty(file.keyname)) {
+                    if(cacheData[file.bucket][file.keyname] === file.hash) {
+                        gutil.log(gutil.colors.gray("Matched cache file ....."), keyname);
+                        return callback(null, file);
+                    }
                 }
 
-                if(getData && getData.ETag === '"' + md5(file.contents) + '"') {
-                    gutil.log(gutil.colors.magenta("No Change ....."), keyname);
-                    return callback(null);
+                // === Mime Lookup/Transform ===
+
+                mime_lookup_name = keyname;
+
+                if(options.mimeTypeLookup) {
+                    mime_lookup_name = options.mimeTypeLookup(keyname);
                 }
 
-                objOpts = helper.filterOptions(options);
+                mimetype = mime.lookup(mime_lookup_name);
 
-                objOpts.Bucket      = the_bucket;
-                objOpts.Key         = keyname;
-                objOpts.Body        = file.contents;
-                objOpts.ContentType = mimetype;
-                objOpts.Metadata    = metadata;
+                // === Charset ===
+                // Just in case text files get garbled. Appends to mimetype.
+                // `charset` field gets filtered out later.
+                if(options.charset && mimetype == 'text/html') {
+                    mimetype += ';charset=' + options.charset;
+                }
 
-                if(options.uploadNewFilesOnly && !getData || !options.uploadNewFilesOnly) {
-                    _s3.putObject(objOpts, function (err, data) {
+                //  === metadataMap ===
+                //  New in V1: Map your files (using the keyname) to a metadata object.
+                //  ONLY if `options.Metadata` is undefined.
 
-                        if(err) {
-                            return callback(new gutil.PluginError(PLUGIN_NAME, "S3 putObject Error: " + err.stack));
-                        }
+                if(!options.Metadata && options.metadataMap) {
+                    if(helper.isMetadataMapFn(options.metadataMap)) {
+                        metadata = options.metadataMap(keyname);
+                    } else {
+                        metadata = options.metadataMap;
+                    }
+                }
 
-                        if(getData) {
-                            if(getData.ETag !== data.ETag) {
-                                gutil.log(gutil.colors.yellow("Updated ......."), keyname);
-                            } else {
-                                gutil.log(gutil.colors.gray("No Change ....."), keyname);
+                //  options.Metadata is not filtered out later.
+
+                gutil.log(gutil.colors.cyan("Uploading ....."), keyname);
+
+                _s3.headObject({
+                    'Bucket': the_bucket,
+                    'Key':    keyname
+                }, function (getErr, getData) {
+
+                    var objOpts;
+
+                    if(getErr && getErr.statusCode !== 404) {
+                        return callback(new gutil.PluginError(PLUGIN_NAME, "S3 headObject Error: " + getErr.stack));
+                    }
+
+                    if(getData && getData.ETag === '"' + file.hash + '"') {
+                        gutil.log(gutil.colors.magenta("No Change ....."), keyname);
+                        return callback(null, file);
+                    }
+
+                    objOpts = helper.filterOptions(options);
+
+                    objOpts.Bucket      = the_bucket;
+                    objOpts.Key         = keyname;
+                    objOpts.Body        = file.contents;
+                    objOpts.ContentType = mimetype;
+                    objOpts.Metadata    = metadata;
+
+                    if(options.uploadNewFilesOnly && !getData || !options.uploadNewFilesOnly) {
+                        _s3.putObject(objOpts, function (err, data) {
+
+                            if(err) {
+                                return callback(new gutil.PluginError(PLUGIN_NAME, "S3 putObject Error: " + err.stack));
                             }
-                        } else {
-                            // doesn't exist in bucket, the object is new to the bucket
-                            gutil.log(gutil.colors.green("Uploaded! ....."), keyname);
-                        }
 
-                        callback(null);
-                    });
-                }
+                            if(getData) {
+                                if(getData.ETag !== data.ETag) {
+                                    gutil.log(gutil.colors.yellow("Updated ......."), keyname);
+                                } else {
+                                    gutil.log(gutil.colors.gray("No Change ....."), keyname);
+                                }
+                            } else {
+                                // doesn't exist in bucket, the object is new to the bucket
+                                gutil.log(gutil.colors.green("Uploaded! ....."), keyname);
+                            }
+
+                            callback(null, file);
+                        });
+                    }
+                });
             });
         });
-
-        return stream;
     };
+
+    plugin.cache = function () {
+        var cache = {};
+
+        return through.obj(function (file, enc, cb) {
+            if (!cache.hasOwnProperty(file.bucket)) {
+                cache[file.bucket] = {};
+            }
+
+            cache[file.bucket][file.keyname] = file.hash;
+
+            cb();
+        }, function (cb) {
+            getCacheFile({ path: CACHE_FILE_PATH}, function (err, cacheFile) {
+                if (err) {
+                    cb(err);
+                    return;
+                }
+
+                var oldCache = {};
+
+                try {
+                    oldCache = JSON.parse(cacheFile.contents.toString());
+                } catch (err) {}
+
+                for (bucket in cache) {
+                    if(oldCache.hasOwnProperty(bucket)) {
+                        cache[bucket] = objectAssign(oldCache[bucket], cache[bucket]);
+                    }
+                }
+
+                cacheFile.contents = new Buffer(JSON.stringify(cache, null, '  '));
+                this.push(cacheFile);
+                cb();
+            }.bind(this));
+        });
+    };
+
+    return plugin;
 };
 
-// ===== EXPORTING MAIN PLUGIN FUNCTION =====
 // `config` now takes the paramters from the AWS-SDK constructor:
 // http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/Config.html#constructor-property
 
